@@ -22,9 +22,10 @@ import java.util.Locale
  * Foreground service that:
  * - Listens for Reels start/stop broadcasts from ReelsAccessibilityService
  * - Ticks a timer every second while Reels is active
- * - Persists today's total to SharedPreferences
+ * - Persists today's total AND break period to SharedPreferences (survives restarts)
  * - Launches BlockerActivity when the user's limit is exceeded
  * - Resets the daily counter at midnight
+ * - Restarts itself automatically if killed (START_STICKY)
  */
 class TimerService : Service() {
 
@@ -38,48 +39,29 @@ class TimerService : Service() {
         const val ACTION_RESET_TODAY = "com.reelsguard.RESET_TODAY"
         const val ACTION_TICK = "com.reelsguard.TICK"
 
-        // Broadcast for UI updates
         const val EXTRA_SECONDS_TODAY = "seconds_today"
         const val EXTRA_IS_ON_REELS = "is_on_reels"
+        const val EXTRA_IN_BREAK = "in_break"
     }
 
     private val handler = Handler(Looper.getMainLooper())
     private var isTrackingReels = false
     private var blockerShown = false
-    private var breakUntilMs = 0L   // grace period after being blocked
 
-    private val tickRunnable = object : Runnable {
-        override fun run() {
-            if (isTrackingReels && !blockerShown) {
-                checkDailyReset()
-                AppPreferences.reelsSecondsToday += 1
-                val elapsed = AppPreferences.reelsSecondsToday
-                val limit = AppPreferences.timeLimitSeconds()
+    // Always read break state from SharedPreferences — never from memory alone
+    private val isInBreak: Boolean
+        get() = System.currentTimeMillis() < AppPreferences.breakUntilMs
 
-                Log.d(TAG, "Reels time today: ${elapsed}s / limit: ${limit}s")
-
-                updateNotification(elapsed, limit)
-                broadcastTick(elapsed)
-
-                if (elapsed >= limit) {
-                    triggerBlocker()
-                    return // stop ticking until reset
-                }
-            }
-            handler.postDelayed(this, 1000)
-        }
-    }
-
-    // Receives signals from the Accessibility Service
     private val reelsReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
                 ReelsAccessibilityService.ACTION_REELS_STARTED -> {
-                    if (System.currentTimeMillis() < breakUntilMs) {
-                        Log.d(TAG, "In break period, ignoring Reels start")
+                    if (isInBreak) {
+                        Log.d(TAG, "In break — blocking Reels access")
+                        showBlocker()
                         return
                     }
-                    Log.d(TAG, "Reels started")
+                    Log.d(TAG, "Reels started — tracking")
                     isTrackingReels = true
                     blockerShown = false
                 }
@@ -92,6 +74,36 @@ class TimerService : Service() {
         }
     }
 
+    private val tickRunnable = object : Runnable {
+        override fun run() {
+            if (isTrackingReels && !blockerShown) {
+                checkDailyReset()
+
+                // Guard: re-check break on every tick (handles restarts mid-break)
+                if (isInBreak) {
+                    isTrackingReels = false
+                    showBlocker()
+                    handler.postDelayed(this, 1000)
+                    return
+                }
+
+                AppPreferences.reelsSecondsToday += 1
+                val elapsed = AppPreferences.reelsSecondsToday
+                val limit = AppPreferences.timeLimitSeconds()
+
+                updateNotification(elapsed, limit)
+                broadcastTick(elapsed, false)
+
+                if (elapsed >= limit) {
+                    triggerBlocker()
+                }
+            }
+            handler.postDelayed(this, 1000)
+        }
+    }
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
+
     override fun onCreate() {
         super.onCreate()
         AppPreferences.init(this)
@@ -102,17 +114,28 @@ class TimerService : Service() {
             addAction(ReelsAccessibilityService.ACTION_REELS_STOPPED)
         }
         registerReceiver(reelsReceiver, filter, RECEIVER_NOT_EXPORTED)
+
+        // KEY FIX: Restore break state on startup
+        // If the service was killed while a break was active, resume enforcing it
+        if (isInBreak) {
+            Log.d(TAG, "Service restarted mid-break — enforcing break until ${AppPreferences.breakUntilMs}")
+            blockerShown = true
+            isTrackingReels = false
+        }
+
+        TimerServiceState.isRunning = true
         handler.post(tickRunnable)
-        Log.d(TAG, "TimerService created")
+        Log.d(TAG, "TimerService started")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_RESET_TODAY -> {
                 AppPreferences.reelsSecondsToday = 0
+                AppPreferences.breakUntilMs = 0L  // clear persisted break
                 blockerShown = false
-                breakUntilMs = 0L
-                broadcastTick(0)
+                isTrackingReels = false
+                broadcastTick(0, false)
                 updateNotification(0, AppPreferences.timeLimitSeconds())
             }
             ACTION_STOP -> {
@@ -122,10 +145,12 @@ class TimerService : Service() {
             }
         }
 
-        startForeground(NOTIFICATION_ID, buildNotification(
-            AppPreferences.reelsSecondsToday,
-            AppPreferences.timeLimitSeconds()
-        ))
+        startForeground(
+            NOTIFICATION_ID,
+            buildNotification(AppPreferences.reelsSecondsToday, AppPreferences.timeLimitSeconds())
+        )
+
+        // START_STICKY: Android auto-restarts this service if the system kills it
         return START_STICKY
     }
 
@@ -133,55 +158,58 @@ class TimerService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        TimerServiceState.isRunning = false
         handler.removeCallbacks(tickRunnable)
         unregisterReceiver(reelsReceiver)
-        Log.d(TAG, "TimerService destroyed")
+        Log.d(TAG, "TimerService destroyed — system will restart it")
     }
 
-    // ── Internal helpers ──────────────────────────────────────────────────────
+    // ── Block logic ───────────────────────────────────────────────────────────
 
     private fun triggerBlocker() {
+        Log.d(TAG, "Limit reached — starting mandatory break")
+        val breakMs = AppPreferences.breakDurationMinutes * 60_000L
+        // PERSISTED to SharedPreferences — survives service restarts
+        AppPreferences.breakUntilMs = System.currentTimeMillis() + breakMs
         blockerShown = true
         isTrackingReels = false
-        val breakMs = AppPreferences.breakDurationMinutes * 60_000L
-        breakUntilMs = System.currentTimeMillis() + breakMs
+        showBlocker()
+    }
 
+    private fun showBlocker() {
         val intent = Intent(this, BlockerActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or
                     Intent.FLAG_ACTIVITY_CLEAR_TOP or
                     Intent.FLAG_ACTIVITY_SINGLE_TOP
-            putExtra(BlockerActivity.EXTRA_BREAK_DURATION_MINUTES, AppPreferences.breakDurationMinutes)
+            putExtra(BlockerActivity.EXTRA_BREAK_UNTIL_MS, AppPreferences.breakUntilMs)
             putExtra(BlockerActivity.EXTRA_LIMIT_MINUTES, AppPreferences.timeLimitMinutes)
         }
         startActivity(intent)
 
-        // Also navigate to home so Instagram goes to background
-        val home = Intent(Intent.ACTION_MAIN).apply {
+        // Push Instagram to background
+        startActivity(Intent(Intent.ACTION_MAIN).apply {
             addCategory(Intent.CATEGORY_HOME)
             flags = Intent.FLAG_ACTIVITY_NEW_TASK
-        }
-        startActivity(home)
-
-        // Resume ticking so we can pick up next session after break
-        handler.postDelayed(tickRunnable, 1000)
+        })
     }
 
     private fun checkDailyReset() {
         val today = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
         if (AppPreferences.lastResetDate != today) {
             AppPreferences.reelsSecondsToday = 0
+            AppPreferences.breakUntilMs = 0L
             AppPreferences.lastResetDate = today
             blockerShown = false
-            breakUntilMs = 0L
             Log.d(TAG, "Daily counter reset for $today")
         }
     }
 
-    private fun broadcastTick(seconds: Long) {
+    private fun broadcastTick(seconds: Long, inBreak: Boolean) {
         sendBroadcast(Intent(ACTION_TICK).apply {
             setPackage(packageName)
             putExtra(EXTRA_SECONDS_TODAY, seconds)
             putExtra(EXTRA_IS_ON_REELS, isTrackingReels)
+            putExtra(EXTRA_IN_BREAK, inBreak)
         })
     }
 
@@ -189,9 +217,7 @@ class TimerService : Service() {
 
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
-            CHANNEL_ID,
-            "ReelsGuard",
-            NotificationManager.IMPORTANCE_LOW
+            CHANNEL_ID, "ReelsGuard", NotificationManager.IMPORTANCE_LOW
         ).apply {
             description = "Tracks your Reels watch time"
             setShowBadge(false)
@@ -200,9 +226,14 @@ class TimerService : Service() {
     }
 
     private fun buildNotification(elapsedSeconds: Long, limitSeconds: Long): Notification {
-        val elapsed = formatTime(elapsedSeconds)
-        val limit = formatTime(limitSeconds)
-        val remaining = formatTime(maxOf(0, limitSeconds - elapsedSeconds))
+        val statusText = when {
+            isInBreak -> {
+                val remainingBreakSec = (AppPreferences.breakUntilMs - System.currentTimeMillis()) / 1000
+                "🛑 Break: ${formatTime(remainingBreakSec)} remaining"
+            }
+            isTrackingReels -> "🔴 Reels: ${formatTime(elapsedSeconds)} / ${formatTime(limitSeconds)}"
+            else -> "⚪ Today: ${formatTime(elapsedSeconds)} / ${formatTime(limitSeconds)}"
+        }
 
         val openIntent = PendingIntent.getActivity(
             this, 0,
@@ -213,7 +244,7 @@ class TimerService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_recent_history)
             .setContentTitle("ReelsGuard Active")
-            .setContentText("Reels today: $elapsed / $limit  •  $remaining left")
+            .setContentText(statusText)
             .setContentIntent(openIntent)
             .setOngoing(true)
             .setSilent(true)
@@ -221,13 +252,12 @@ class TimerService : Service() {
     }
 
     private fun updateNotification(elapsedSeconds: Long, limitSeconds: Long) {
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.notify(NOTIFICATION_ID, buildNotification(elapsedSeconds, limitSeconds))
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIFICATION_ID, buildNotification(elapsedSeconds, limitSeconds))
     }
 
     private fun formatTime(seconds: Long): String {
-        val m = seconds / 60
-        val s = seconds % 60
-        return if (m > 0) "${m}m ${s}s" else "${s}s"
+        val s = maxOf(0L, seconds)
+        return if (s >= 60) "${s / 60}m ${s % 60}s" else "${s}s"
     }
 }

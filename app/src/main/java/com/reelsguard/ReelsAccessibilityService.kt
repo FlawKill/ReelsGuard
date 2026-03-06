@@ -8,14 +8,11 @@ import android.view.accessibility.AccessibilityNodeInfo
 
 /**
  * Accessibility Service that watches Instagram and detects when the user
- * is on the Reels tab. Communicates with TimerService via broadcasts.
+ * is on the Reels tab.
  *
- * Detection strategy:
- * 1. Check the foreground package is com.instagram.android
- * 2. Scan the view hierarchy for the Reels tab indicator:
- *    - Content description "Reels" on a selected tab
- *    - Or the Reels BottomBar item being selected
- *    - Or the window class contains "Reels" view IDs
+ * KEY FIX: On every Instagram event, this service checks if TimerService
+ * is running and restarts it if monitoring is enabled but the service was
+ * killed by the system. This means the user NEVER has to manually re-toggle.
  */
 class ReelsAccessibilityService : AccessibilityService() {
 
@@ -24,15 +21,9 @@ class ReelsAccessibilityService : AccessibilityService() {
         const val ACTION_REELS_STARTED = "com.reelsguard.REELS_STARTED"
         const val ACTION_REELS_STOPPED = "com.reelsguard.REELS_STOPPED"
 
-        // Instagram's known view identifiers for Reels navigation tab
         private val REELS_CONTENT_DESCRIPTIONS = setOf(
-            "Reels",
-            "Reels tab",
-            "Reels, tab",
-            "Reel"
+            "Reels", "Reels tab", "Reels, tab", "Reel"
         )
-
-        // Instagram's resource IDs for the Reels tab (may change across versions)
         private val REELS_VIEW_IDS = setOf(
             "com.instagram.android:id/clips_tab",
             "com.instagram.android:id/reels_tab",
@@ -41,12 +32,18 @@ class ReelsAccessibilityService : AccessibilityService() {
     }
 
     private var isOnReels = false
-    private var currentPackage = ""
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        AppPreferences.init(this)
+        Log.d(TAG, "Accessibility service connected")
+        // Ensure TimerService is running when accessibility service connects
+        ensureTimerServiceRunning()
+    }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         val pkg = event.packageName?.toString() ?: return
 
-        // Only process Instagram events
         if (pkg != "com.instagram.android") {
             if (isOnReels) {
                 isOnReels = false
@@ -55,14 +52,28 @@ class ReelsAccessibilityService : AccessibilityService() {
             return
         }
 
-        currentPackage = pkg
+        // Every time we get an Instagram event, make sure TimerService is alive
+        ensureTimerServiceRunning()
 
         when (event.eventType) {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED,
-            AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
-                checkIfOnReels()
+            AccessibilityEvent.TYPE_VIEW_SCROLLED -> checkIfOnReels()
+        }
+    }
+
+    /**
+     * Ensures TimerService is running if monitoring is enabled.
+     * This is the fix for the "have to re-toggle" bug — the accessibility service
+     * acts as a watchdog that revives the timer service whenever Instagram is used.
+     */
+    private fun ensureTimerServiceRunning() {
+        if (AppPreferences.monitoringEnabled && !TimerServiceState.isRunning) {
+            Log.d(TAG, "TimerService not running — restarting it")
+            val intent = Intent(this, TimerService::class.java).apply {
+                action = TimerService.ACTION_START
             }
+            startForegroundService(intent)
         }
     }
 
@@ -73,17 +84,16 @@ class ReelsAccessibilityService : AccessibilityService() {
 
         if (onReelsNow && !isOnReels) {
             isOnReels = true
-            Log.d(TAG, "Reels tab DETECTED — starting timer")
+            Log.d(TAG, "Reels tab DETECTED")
             broadcastReelsStarted()
         } else if (!onReelsNow && isOnReels) {
             isOnReels = false
-            Log.d(TAG, "Reels tab EXITED — pausing timer")
+            Log.d(TAG, "Reels tab EXITED")
             broadcastReelsStopped()
         }
     }
 
     private fun isReelsTabActive(root: AccessibilityNodeInfo): Boolean {
-        // Strategy 1: Find selected tab with "Reels" content description
         for (id in REELS_VIEW_IDS) {
             val nodes = root.findAccessibilityNodeInfosByViewId(id)
             if (nodes.isNotEmpty()) {
@@ -92,21 +102,15 @@ class ReelsAccessibilityService : AccessibilityService() {
                 if (isSelected) return true
             }
         }
-
-        // Strategy 2: Traverse for selected Reels tab by content description
         return findReelsTabByDescription(root)
     }
 
     private fun findReelsTabByDescription(node: AccessibilityNodeInfo): Boolean {
         val cd = node.contentDescription?.toString() ?: ""
-        if (cd in REELS_CONTENT_DESCRIPTIONS && (node.isSelected || node.isChecked)) {
-            return true
-        }
-        // Also check text
         val text = node.text?.toString() ?: ""
-        if (text in REELS_CONTENT_DESCRIPTIONS && (node.isSelected || node.isChecked)) {
-            return true
-        }
+        if ((cd in REELS_CONTENT_DESCRIPTIONS || text in REELS_CONTENT_DESCRIPTIONS)
+            && (node.isSelected || node.isChecked)
+        ) return true
 
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
@@ -119,24 +123,16 @@ class ReelsAccessibilityService : AccessibilityService() {
         return false
     }
 
-    private fun broadcastReelsStarted() {
+    private fun broadcastReelsStarted() =
         sendBroadcast(Intent(ACTION_REELS_STARTED).setPackage(packageName))
-    }
 
-    private fun broadcastReelsStopped() {
+    private fun broadcastReelsStopped() =
         sendBroadcast(Intent(ACTION_REELS_STOPPED).setPackage(packageName))
-    }
 
     override fun onInterrupt() {
         if (isOnReels) {
             isOnReels = false
             broadcastReelsStopped()
         }
-        Log.d(TAG, "Service interrupted")
-    }
-
-    override fun onServiceConnected() {
-        super.onServiceConnected()
-        Log.d(TAG, "Accessibility service connected")
     }
 }
