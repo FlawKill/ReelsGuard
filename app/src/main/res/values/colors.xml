@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Brand -->
+    <color name="primary">#6C63FF</color>
+    <color name="primary_dark">#4B44CC</color>
+
+    <!-- Backgrounds -->
+    <color name="background">#F4F6FB</color>
+    <color name="card_bg">#FFFFFF</color>
+    <color name="progress_bg">#E0E0E0</color>
+
+    <!-- Text -->
+    <color name="text_primary">#1A1A2E</color>
+    <color name="text_secondary">#6B7280</color>
+    <color name="warning">#F59E0B</color>
+
+    <!-- Blocker screen -->
+    <color name="blocker_bg">#1A1A2E</color>
+    <color name="blocker_text_primary">#FFFFFF</color>
+    <color name="blocker_text_secondary">#A0AEC0</color>
+    <color name="blocker_accent">#6C63FF</color>
+    <color name="blocker_card">#2D2D4E</color>
+
+    <!-- Material defaults -->
+    <color name="purple_200">#FFBB86FC</color>
+    <color name="purple_500">#FF6200EE</color>
+    <color name="purple_700">#FF3700B3</color>
+    <color name="teal_200">#FF03DAC5</color>
+    <color name="teal_700">#FF018786</color>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+</resources>

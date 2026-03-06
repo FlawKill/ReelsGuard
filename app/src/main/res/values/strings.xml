@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">ReelsGuard</string>
+    <string name="accessibility_service_description">
+        ReelsGuard monitors when you open the Instagram Reels tab.
+        It tracks your viewing duration and blocks access when your set daily limit is reached.
+        No personal content or messages are ever read or transmitted.
+    </string>
+</resources>
