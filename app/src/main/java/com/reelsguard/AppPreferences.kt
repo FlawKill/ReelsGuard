@@ -11,6 +11,7 @@ object AppPreferences {
     private const val KEY_REELS_SECONDS_TODAY = "reels_seconds_today"
     private const val KEY_LAST_RESET_DATE = "last_reset_date"
     private const val KEY_BREAK_DURATION_MINUTES = "break_duration_minutes"
+    private const val KEY_BREAK_UNTIL_MS = "break_until_ms"
 
     private fun prefs(context: Context): SharedPreferences =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -39,6 +40,11 @@ object AppPreferences {
     var breakDurationMinutes: Int
         get() = _prefs?.getInt(KEY_BREAK_DURATION_MINUTES, 10) ?: 10
         set(value) { _prefs?.edit()?.putInt(KEY_BREAK_DURATION_MINUTES, value)?.apply() }
+
+    // Timestamp (epoch ms) until which break is active — persisted across restarts
+    var breakUntilMs: Long
+        get() = _prefs?.getLong(KEY_BREAK_UNTIL_MS, 0L) ?: 0L
+        set(value) { _prefs?.edit()?.putLong(KEY_BREAK_UNTIL_MS, value)?.apply() }
 
     private var _prefs: SharedPreferences? = null
 
